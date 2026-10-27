@@ -11,6 +11,7 @@ import io
 import json
 import locale
 import math
+import os
 import random
 import re
 import signal
@@ -27,6 +28,7 @@ from typing import (
     Any,
     Callable,
     Literal,
+    NamedTuple,
     TextIO,
     TypeAlias,
     get_args,
@@ -38,7 +40,7 @@ import websockets
 import yaml
 from lxml import etree
 from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
-from pydantic import BaseModel, Field, PrivateAttr, validator
+from pydantic import BaseModel, Field, PrivateAttr, root_validator, validator
 from pydantic.fields import Undefined
 from rich.console import Console
 from rich.table import Table
@@ -915,13 +917,49 @@ class Page(BaseModel):
         return cls.to_pandas_table().to_markdown(index=False)
 
 
-class Screensaver(BaseModel, extra="forbid"):  # type: ignore[call-arg]
-    """Photo slideshow across all keys, shown after a period without key presses."""
+class Immich(BaseModel, extra="forbid"):  # type: ignore[call-arg]
+    """Photos from an album in [Immich](https://immich.app)."""
 
-    folder: str = Field(
+    url: str = Field(
+        description="Address of the Immich server, e.g. `http://192.168.1.20:2283`.",
+    )
+    album: str = Field(
+        description="Name or ID of the album. Shared albums work too.",
+    )
+    api_key: str | None = Field(
+        default=None,
+        description="Immich API key (needs `album.read`, `asset.read` and `asset.view`)."
+        " If empty, the `IMMICH_API_KEY` environment variable is used,"
+        " so the key doesn't have to be in the configuration file.",
+    )
+
+    @classmethod
+    def to_pandas_table(cls: type[Immich]) -> pd.DataFrame:
+        """Return a pandas DataFrame with the schema."""
+        return to_pandas_table(cls)
+
+    @classmethod
+    def to_markdown_table(cls: type[Immich]) -> str:
+        """Return a markdown table with the schema."""
+        return cls.to_pandas_table().to_markdown(index=False)
+
+
+class Screensaver(BaseModel, extra="forbid"):  # type: ignore[call-arg]
+    """Photo slideshow across all keys, shown after a period without key presses.
+
+    The photos come from a `folder` or from an `immich` album (exactly one of both).
+    """
+
+    folder: str | None = Field(
+        default=None,
         description="Folder with photos (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, `.bmp`),"
         " searched recursively. A relative path is relative to the configuration file,"
         " e.g. `photos` next to `/config/streamdeck-config.yaml` is `/config/photos`.",
+    )
+    immich: Immich | None = Field(
+        default=None,
+        description="Show the photos of an Immich album instead of a folder."
+        " See `Immich` for the options. New photos in the album appear automatically.",
     )
     after: float = Field(
         default=300,
@@ -946,6 +984,13 @@ class Screensaver(BaseModel, extra="forbid"):  # type: ignore[call-arg]
             msg = "must be larger than 0"
             raise ValueError(msg)
         return v
+
+    @root_validator(skip_on_failure=True)
+    def _validate_source(cls, values: dict[str, Any]) -> dict[str, Any]:
+        if (values.get("folder") is None) == (values.get("immich") is None):
+            msg = "set either `folder` or `immich`"
+            raise ValueError(msg)
+        return values
 
     @classmethod
     def to_pandas_table(cls: type[Screensaver]) -> pd.DataFrame:
@@ -1595,14 +1640,96 @@ SCREENSAVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 
 def _screensaver_folder(config: Config) -> Path:
     assert config.screensaver is not None
+    assert config.screensaver.folder is not None
     folder = Path(config.screensaver.folder).expanduser()
     if not folder.is_absolute() and config._configuration_file is not None:
         folder = config._configuration_file.parent / folder
     return folder
 
 
-def _screensaver_photos(config: Config) -> list[Path]:
-    """All photos in the screensaver folder (recursively), sorted by path."""
+class ImmichPhoto(NamedTuple):
+    """A photo in an Immich album."""
+
+    url: str
+    asset_id: str
+    api_key: str
+
+    def __str__(self) -> str:
+        """Short name for log messages (without the API key)."""
+        return f"Immich photo {self.asset_id}"
+
+
+IMMICH_TIMEOUT = 15
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _immich_get(immich: Immich, api_key: str, path: str, **params: Any) -> requests.Response:
+    response = requests.get(
+        f"{immich.url.rstrip('/')}/api/{path}",
+        headers={"x-api-key": api_key},
+        params=params,
+        timeout=IMMICH_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response
+
+
+def _immich_album_id(immich: Immich, api_key: str) -> str:
+    if _UUID.match(immich.album):
+        return immich.album
+    albums = _immich_get(immich, api_key, "albums").json()
+    albums += _immich_get(immich, api_key, "albums", shared="true").json()
+    for album in albums:
+        if album["albumName"].strip().lower() == immich.album.strip().lower():
+            return album["id"]
+    names = sorted({a["albumName"] for a in albums})
+    msg = f"no album {immich.album!r} in Immich (albums: {', '.join(names) or 'none'})"
+    raise ValueError(msg)
+
+
+def _immich_search_album(immich: Immich, api_key: str, album_id: str) -> list[dict[str, Any]]:
+    """Album assets via the search API (for Immich versions that leave them out of the album)."""
+    assets: list[dict[str, Any]] = []
+    page: int | str | None = 1
+    while page:
+        response = requests.post(
+            f"{immich.url.rstrip('/')}/api/search/metadata",
+            headers={"x-api-key": api_key},
+            json={"albumIds": [album_id], "type": "IMAGE", "size": 1000, "page": int(page)},
+            timeout=IMMICH_TIMEOUT,
+        )
+        response.raise_for_status()
+        result = response.json()["assets"]
+        assets += result["items"]
+        page = result.get("nextPage")
+    return assets
+
+
+def _immich_photos(immich: Immich) -> list[ImmichPhoto]:
+    """The photos (no videos) in the Immich album, sorted by date taken."""
+    api_key = immich.api_key or os.environ.get("IMMICH_API_KEY")
+    if not api_key:
+        msg = "no Immich API key: set `api_key` or the IMMICH_API_KEY environment variable"
+        raise ValueError(msg)
+    album_id = _immich_album_id(immich, api_key)
+    album = _immich_get(immich, api_key, f"albums/{album_id}", withoutAssets="false").json()
+    assets = album.get("assets") or []
+    if not assets and album.get("assetCount"):
+        assets = _immich_search_album(immich, api_key, album_id)
+    assets = [a for a in assets if a.get("type") == "IMAGE"]
+    assets.sort(key=lambda a: a.get("fileCreatedAt") or "")
+    return [ImmichPhoto(immich.url, a["id"], api_key) for a in assets]
+
+
+def _screensaver_photos(config: Config) -> list[Path | ImmichPhoto]:
+    """All photos for the screensaver, sorted. Blocking (may use the network)."""
+    assert config.screensaver is not None
+    if config.screensaver.immich is not None:
+        try:
+            return list(_immich_photos(config.screensaver.immich))
+        except Exception as e:  # noqa: BLE001
+            console.log(f"[b red]Screensaver: cannot get the Immich album: {e}[/]")
+            return []
     folder = _screensaver_folder(config)
     if not folder.is_dir():
         return []
@@ -1636,13 +1763,28 @@ def _photo_tiles(
     return tiles
 
 
-def _screensaver_frame(deck: StreamDeck, path: Path) -> list[bytes] | None:
+def _open_photo(photo: Path | ImmichPhoto) -> Image.Image:
+    if isinstance(photo, ImmichPhoto):
+        # The "preview" size (about 1440 px) is plenty for the keys and much
+        # lighter than the original
+        response = requests.get(
+            f"{photo.url.rstrip('/')}/api/assets/{photo.asset_id}/thumbnail",
+            headers={"x-api-key": photo.api_key},
+            params={"size": "preview"},
+            timeout=IMMICH_TIMEOUT,
+        )
+        response.raise_for_status()
+        return Image.open(io.BytesIO(response.content))
+    return Image.open(photo)
+
+
+def _screensaver_frame(deck: StreamDeck, path: Path | ImmichPhoto) -> list[bytes] | None:
     """Load a photo and turn it into native key images. Runs in a thread."""
     rows, cols = deck.key_layout()
     key_size = deck.key_image_format()["size"]
     gap = round(key_size[0] / 3)  # roughly the space between two keys
     try:
-        with Image.open(path) as image:
+        with _open_photo(path) as image:
             image.draft("RGB", (cols * key_size[0] * 2, rows * key_size[1] * 2))  # fast JPEG decode
             tiles = _photo_tiles(image, rows, cols, key_size, gap)
     except Exception as e:  # noqa: BLE001
@@ -1654,18 +1796,20 @@ def _screensaver_frame(deck: StreamDeck, path: Path) -> list[bytes] | None:
 async def start_screensaver(config: Config, deck: StreamDeck) -> None:
     """Show the photo slideshow until a key press calls `stop_screensaver`."""
     assert config.screensaver is not None
-    photos = _screensaver_photos(config)
+    photos = await asyncio.to_thread(_screensaver_photos, config)
     if not photos:
-        console.log(f"[b red]Screensaver: no photos found in {_screensaver_folder(config)}[/]")
+        where = "the Immich album" if config.screensaver.immich else _screensaver_folder(config)
+        console.log(f"[b red]Screensaver: no photos found in {where}[/]")
         return
     console.log(f"Starting screensaver with {len(photos)} photos")
     config._screensaver_active = True
     if config.screensaver.brightness is not None:
         deck.set_brightness(config.screensaver.brightness)
-    queue: list[Path] = []
+    queue: list[Path | ImmichPhoto] = []
     while config._screensaver_active:
         if not queue:
-            queue = _screensaver_photos(config) or photos  # picks up added photos
+            # picks up added photos
+            queue = await asyncio.to_thread(_screensaver_photos, config) or photos
             if config.screensaver.shuffle:
                 random.shuffle(queue)
         frame = await asyncio.to_thread(_screensaver_frame, deck, queue.pop(0))
@@ -3315,7 +3459,6 @@ def _get_signal_handler(deck: StreamDeck) -> Callable[[int, FrameType | None], N
 def main() -> None:
     """Start the Stream Deck integration."""
     import argparse
-    import os
 
     from dotenv import load_dotenv
 
