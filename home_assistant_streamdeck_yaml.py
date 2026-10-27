@@ -18,6 +18,7 @@ import ssl
 import sys
 import time
 import warnings
+import zipfile
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -61,6 +62,9 @@ except PackageNotFoundError:
 
 SCRIPT_DIR = Path(__file__).parent
 ASSETS_PATH = SCRIPT_DIR / "assets"
+# Optional archive with all Material Design Icons (`<name>.svg`), e.g. built into
+# the add-on image, so icons don't have to be downloaded from GitHub
+MDI_ARCHIVE = ASSETS_PATH / "mdi.zip"
 DEFAULT_CONFIG = SCRIPT_DIR / "configuration.yaml"
 DEFAULT_FONT: str = "Roboto-Regular.ttf"
 DEFAULT_MDI_ICONS = {
@@ -2102,12 +2106,23 @@ def _convert_to_grayscale(image: Image.Image) -> Image.Image:
     return image.convert("L").convert("RGB")
 
 
+def _bundled_mdi(icon_mdi: str) -> bytes | None:
+    """Return the SVG from `MDI_ARCHIVE`, or None if it isn't there."""
+    if not MDI_ARCHIVE.is_file():
+        return None
+    try:
+        with zipfile.ZipFile(MDI_ARCHIVE) as archive:
+            return archive.read(f"{icon_mdi}.svg")
+    except (KeyError, zipfile.BadZipFile):
+        return None
+
+
 def _download_and_save_mdi(icon_mdi: str) -> Path:
     url = _mdi_url(icon_mdi)
     filename_svg = ASSETS_PATH / f"{icon_mdi}.svg"
     if filename_svg.exists():
         return filename_svg
-    svg_content = _download(url)
+    svg_content = _bundled_mdi(icon_mdi) or _download(url)
     try:
         etree.fromstring(svg_content)
     except etree.XMLSyntaxError:

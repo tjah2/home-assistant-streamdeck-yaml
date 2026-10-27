@@ -8,6 +8,7 @@ import io
 import json
 import sys
 import textwrap
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, call, patch
@@ -20,6 +21,7 @@ from pydantic import ValidationError
 from StreamDeck.Devices.StreamDeckOriginal import StreamDeckOriginal
 from websockets.exceptions import ConnectionClosedError  # noqa: F401
 
+import home_assistant_streamdeck_yaml as hasy
 from home_assistant_streamdeck_yaml import (
     ASSETS_PATH,
     DEFAULT_CONFIG,
@@ -396,6 +398,27 @@ def test_download_and_save_mdi() -> None:
     filename = _download_and_save_mdi("phone")
     assert filename.exists()
     filename.unlink()
+
+
+def test_mdi_from_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Icons in `MDI_ARCHIVE` are used without downloading."""
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg>'
+    archive = tmp_path / "mdi.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("test-icon.svg", svg)
+    monkeypatch.setattr(hasy, "ASSETS_PATH", tmp_path)
+    monkeypatch.setattr(hasy, "MDI_ARCHIVE", archive)
+    downloads = []
+    monkeypatch.setattr(hasy, "_download", lambda url: downloads.append(url) or svg)
+
+    filename = _download_and_save_mdi("test-icon")
+    assert filename == tmp_path / "test-icon.svg"
+    assert filename.read_bytes() == svg
+    assert downloads == []
+
+    # not in the archive: falls back to downloading
+    _download_and_save_mdi("other-icon")
+    assert downloads == [hasy._mdi_url("other-icon")]
 
 
 def test_init_icon() -> None:
