@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import functools as ft
-from typing import TYPE_CHECKING, Any
+import io
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import Mock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from PIL import Image
@@ -15,8 +20,10 @@ from StreamDeck.Devices.StreamDeckOriginal import StreamDeckOriginal
 from home_assistant_streamdeck_yaml import (
     Button,
     Config,
+    Immich,
     Page,
     Screensaver,
+    _immich_photos,
     _on_press_callback,
     _photo_tiles,
     _screensaver_photos,
@@ -27,6 +34,7 @@ from home_assistant_streamdeck_yaml import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 KEY = 72
@@ -198,3 +206,159 @@ async def test_no_photos_no_screensaver(deck: Mock, tmp_path: Path) -> None:
     await asyncio.sleep(0.2)
     assert not config._screensaver_active
     assert deck.set_key_image.call_count == 0
+
+
+# --- Immich ------------------------------------------------------------------------
+
+ALBUM_ID = "0b6f7c3e-1d2a-4c5b-8e9f-112233445566"
+SHARED_ID = "aa6f7c3e-1d2a-4c5b-8e9f-112233445566"
+
+
+class _FakeImmich(BaseHTTPRequestHandler):
+    """Just enough of the Immich API: albums, album assets, search and thumbnails."""
+
+    api_key = "geheim"
+    with_assets = True  # newer Immich versions leave them out of the album
+    requests: ClassVar[list[str]] = []
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+    def _send(self, body: Any, content_type: str = "application/json") -> None:
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _check_key(self) -> bool:
+        if self.headers.get("x-api-key") != self.api_key:
+            self.send_response(401)
+            self.end_headers()
+            return False
+        self.requests.append(self.path)
+        return True
+
+    assets: ClassVar[list[dict[str, Any]]] = [
+        {"id": "p2", "type": "IMAGE", "fileCreatedAt": "2024-02-01T00:00:00Z"},
+        {"id": "v1", "type": "VIDEO", "fileCreatedAt": "2024-01-15T00:00:00Z"},
+        {"id": "p1", "type": "IMAGE", "fileCreatedAt": "2024-01-01T00:00:00Z"},
+    ]
+
+    def do_GET(self) -> None:
+        if not self._check_key():
+            return
+        path = urlparse(self.path)
+        query = parse_qs(path.query)
+        if path.path == "/api/albums":
+            if query.get("shared") == ["true"]:
+                self._send([{"id": SHARED_ID, "albumName": "Gedeeld"}])
+            else:
+                self._send([{"id": ALBUM_ID, "albumName": "Stream Deck"}])
+        elif path.path in (f"/api/albums/{ALBUM_ID}", f"/api/albums/{SHARED_ID}"):
+            album = {"id": ALBUM_ID, "assetCount": len(self.assets)}
+            if self.with_assets:
+                album["assets"] = self.assets
+            self._send(album)
+        elif path.path.startswith("/api/assets/") and path.path.endswith("/thumbnail"):
+            assert query.get("size") == ["preview"]
+            buffer = io.BytesIO()
+            Image.new("RGB", (1440, 960), "purple").save(buffer, format="JPEG")
+            self._send(buffer.getvalue(), "image/jpeg")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self) -> None:
+        if not self._check_key():
+            return
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        assert self.path == "/api/search/metadata"
+        assert body["albumIds"] == [ALBUM_ID]
+        images = [a for a in self.assets if a["type"] == body["type"]]
+        self._send({"assets": {"items": images, "nextPage": None}})
+
+
+@pytest.fixture
+def immich() -> Iterator[str]:
+    """URL of a fake Immich server."""
+    _FakeImmich.with_assets = True
+    _FakeImmich.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeImmich)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+def test_screensaver_needs_folder_or_immich() -> None:
+    """Exactly one photo source."""
+    immich = {"url": "http://immich", "album": "x"}
+    assert Screensaver(immich=immich).immich == Immich(**immich)
+    with pytest.raises(ValidationError, match="either"):
+        Screensaver()
+    with pytest.raises(ValidationError, match="either"):
+        Screensaver(folder="photos", immich=immich)
+    with pytest.raises(ValidationError):
+        Screensaver(immich={"url": "http://immich", "album": "x", "unknown": 1})
+
+
+def test_immich_album_by_name(immich: str) -> None:
+    """Photos of the album, oldest first, without videos."""
+    photos = _immich_photos(Immich(url=immich + "/", album="stream deck", api_key="geheim"))
+    assert [p.asset_id for p in photos] == ["p1", "p2"]
+    assert "geheim" not in str(photos[0])
+
+    # Shared albums and IDs work too
+    for album in ["Gedeeld", ALBUM_ID]:
+        photos = _immich_photos(Immich(url=immich, album=album, api_key="geheim"))
+        assert [p.asset_id for p in photos] == ["p1", "p2"]
+
+
+def test_immich_api_key_from_environment(immich: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without `api_key` the IMMICH_API_KEY environment variable is used."""
+    monkeypatch.delenv("IMMICH_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="API key"):
+        _immich_photos(Immich(url=immich, album="Stream Deck"))
+    monkeypatch.setenv("IMMICH_API_KEY", "geheim")
+    assert _immich_photos(Immich(url=immich, album="Stream Deck"))
+
+
+def test_immich_album_without_assets_uses_search(immich: str) -> None:
+    """Newer Immich versions: the album has no `assets`, so search for them."""
+    _FakeImmich.with_assets = False
+    photos = _immich_photos(Immich(url=immich, album="Stream Deck", api_key="geheim"))
+    assert sorted(p.asset_id for p in photos) == ["p1", "p2"]
+    assert "/api/search/metadata" in _FakeImmich.requests
+
+
+def test_immich_problems_mean_no_photos(immich: str) -> None:
+    """A wrong album or key gives no photos (and a log message), not a crash."""
+    for settings in [
+        {"url": immich, "album": "Bestaat niet", "api_key": "geheim"},
+        {"url": immich, "album": "Stream Deck", "api_key": "fout"},
+        {"url": "http://127.0.0.1:9", "album": "Stream Deck", "api_key": "geheim"},
+    ]:
+        assert _screensaver_photos(Config(screensaver={"immich": settings})) == []
+    with pytest.raises(ValueError, match="Stream Deck"):
+        _immich_photos(Immich(url=immich, album="Bestaat niet", api_key="geheim"))
+
+
+async def test_screensaver_with_immich_album(deck: Mock, immich: str) -> None:
+    """The screensaver shows the preview images of the album on all keys."""
+    config = Config(
+        pages=[Page(name="home", buttons=[Button(text="tekst")])],
+        screensaver={
+            "immich": {"url": immich, "album": "Stream Deck", "api_key": "geheim"},
+            "after": 0.05,
+            "interval": 0.05,
+        },
+    )
+    reset_screensaver_timer(config, deck)
+    await _wait_for(
+        lambda: config._screensaver_active and deck.set_key_image.call_count >= ROWS * COLS,
+    )
+    assert {c.args[0] for c in deck.set_key_image.call_args_list} == set(range(ROWS * COLS))
+    assert any(r.startswith("/api/assets/") for r in _FakeImmich.requests)
+    stop_screensaver(config, deck)
