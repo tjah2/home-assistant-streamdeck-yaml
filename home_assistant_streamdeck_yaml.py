@@ -11,6 +11,7 @@ import io
 import json
 import locale
 import math
+import random
 import re
 import signal
 import ssl
@@ -910,6 +911,49 @@ class Page(BaseModel):
         return cls.to_pandas_table().to_markdown(index=False)
 
 
+class Screensaver(BaseModel, extra="forbid"):  # type: ignore[call-arg]
+    """Photo slideshow across all keys, shown after a period without key presses."""
+
+    folder: str = Field(
+        description="Folder with photos (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, `.bmp`),"
+        " searched recursively. A relative path is relative to the configuration file,"
+        " e.g. `photos` next to `/config/streamdeck-config.yaml` is `/config/photos`.",
+    )
+    after: float = Field(
+        default=300,
+        description="Seconds without a key press before the screensaver starts.",
+    )
+    interval: float = Field(
+        default=15,
+        description="Seconds each photo is shown.",
+    )
+    shuffle: bool = Field(
+        default=True,
+        description="Show the photos in random order (otherwise alphabetically).",
+    )
+    brightness: int | None = Field(
+        default=None,
+        description="Brightness (0-100) while the screensaver runs. If empty, the brightness is unchanged.",
+    )
+
+    @validator("after", "interval")
+    def _validate_positive(cls, v: float) -> float:
+        if v <= 0:
+            msg = "must be larger than 0"
+            raise ValueError(msg)
+        return v
+
+    @classmethod
+    def to_pandas_table(cls: type[Screensaver]) -> pd.DataFrame:
+        """Return a pandas DataFrame with the schema."""
+        return to_pandas_table(cls)
+
+    @classmethod
+    def to_markdown_table(cls: type[Screensaver]) -> str:
+        """Return a markdown table with the schema."""
+        return cls.to_pandas_table().to_markdown(index=False)
+
+
 class Config(BaseModel):
     """Configuration file."""
 
@@ -956,6 +1000,11 @@ class Config(BaseModel):
         default=-1,
         description="Time in seconds to turn off the Stream Deck after inactivity. -1 to disable.",
     )
+    screensaver: Screensaver | None = Field(
+        default=None,
+        description="Show a photo slideshow across all keys after a period of inactivity."
+        " Any key press stops it (that press does nothing else). See `Screensaver` for the options.",
+    )
     _current_page_index: int = PrivateAttr(default=0)
     _parent_page_index: int = PrivateAttr(default=0)
     _is_on: bool = PrivateAttr(default=True)
@@ -963,6 +1012,9 @@ class Config(BaseModel):
     _configuration_file: Path | None = PrivateAttr(default=None)
     _include_files: list[Path] = PrivateAttr(default_factory=list)
     _inactivity_task: asyncio.Task | None = PrivateAttr(default=None)
+    _screensaver_task: asyncio.Task | None = PrivateAttr(default=None)
+    _screensaver_active: bool = PrivateAttr(default=False)
+    _screensaver_wake_keys: set[int] = PrivateAttr(default_factory=set)
 
     @classmethod
     def load(
@@ -1530,6 +1582,136 @@ def reset_inactivity_timer(
 
     if config.inactivity_time > 0:
         config._inactivity_task = asyncio.create_task(turn_off_timer())
+
+    reset_screensaver_timer(config, deck)
+
+
+SCREENSAVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+
+def _screensaver_folder(config: Config) -> Path:
+    assert config.screensaver is not None
+    folder = Path(config.screensaver.folder).expanduser()
+    if not folder.is_absolute() and config._configuration_file is not None:
+        folder = config._configuration_file.parent / folder
+    return folder
+
+
+def _screensaver_photos(config: Config) -> list[Path]:
+    """All photos in the screensaver folder (recursively), sorted by path."""
+    folder = _screensaver_folder(config)
+    if not folder.is_dir():
+        return []
+    return sorted(
+        p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in SCREENSAVER_EXTENSIONS
+    )
+
+
+def _photo_tiles(
+    photo: Image.Image,
+    rows: int,
+    cols: int,
+    key_size: tuple[int, int],
+    gap: int,
+) -> list[Image.Image]:
+    """Cut a photo into one tile per key, so the keys together show the whole photo.
+
+    The photo is scaled and cropped to the size of the whole key grid *including*
+    the space between the keys, so lines in the photo continue straight across keys.
+    Tiles are returned in key order (left to right, top to bottom).
+    """
+    width, height = key_size
+    grid = (cols * width + (cols - 1) * gap, rows * height + (rows - 1) * gap)
+    photo = ImageOps.exif_transpose(photo).convert("RGB")
+    canvas = ImageOps.fit(photo, grid, Image.Resampling.LANCZOS)
+    tiles = []
+    for row in range(rows):
+        for col in range(cols):
+            x, y = col * (width + gap), row * (height + gap)
+            tiles.append(canvas.crop((x, y, x + width, y + height)))
+    return tiles
+
+
+def _screensaver_frame(deck: StreamDeck, path: Path) -> list[bytes] | None:
+    """Load a photo and turn it into native key images. Runs in a thread."""
+    rows, cols = deck.key_layout()
+    key_size = deck.key_image_format()["size"]
+    gap = round(key_size[0] / 3)  # roughly the space between two keys
+    try:
+        with Image.open(path) as image:
+            image.draft("RGB", (cols * key_size[0] * 2, rows * key_size[1] * 2))  # fast JPEG decode
+            tiles = _photo_tiles(image, rows, cols, key_size, gap)
+    except Exception as e:  # noqa: BLE001
+        console.log(f"[b red]Screensaver: cannot show {path}: {e}[/]")
+        return None
+    return [PILHelper.to_native_format(deck, tile) for tile in tiles[: deck.key_count()]]
+
+
+async def start_screensaver(config: Config, deck: StreamDeck) -> None:
+    """Show the photo slideshow until a key press calls `stop_screensaver`."""
+    assert config.screensaver is not None
+    photos = _screensaver_photos(config)
+    if not photos:
+        console.log(f"[b red]Screensaver: no photos found in {_screensaver_folder(config)}[/]")
+        return
+    console.log(f"Starting screensaver with {len(photos)} photos")
+    config._screensaver_active = True
+    if config.screensaver.brightness is not None:
+        deck.set_brightness(config.screensaver.brightness)
+    queue: list[Path] = []
+    while config._screensaver_active:
+        if not queue:
+            queue = _screensaver_photos(config) or photos  # picks up added photos
+            if config.screensaver.shuffle:
+                random.shuffle(queue)
+        frame = await asyncio.to_thread(_screensaver_frame, deck, queue.pop(0))
+        if frame is not None and config._screensaver_active:
+            with deck:
+                for key, image in enumerate(frame):
+                    deck.set_key_image(key, image)
+        await asyncio.sleep(config.screensaver.interval)
+
+
+def reset_screensaver_timer(config: Config, deck: StreamDeck) -> None:
+    """(Re)start the countdown to the screensaver."""
+    if config._screensaver_active:
+        return  # only a key press stops a running screensaver
+    if config._screensaver_task is not None:
+        config._screensaver_task.cancel()
+        config._screensaver_task = None
+    if config.screensaver is None:
+        return
+
+    async def wait_and_start() -> None:
+        assert config.screensaver is not None
+        await asyncio.sleep(config.screensaver.after)
+        if config._is_on:
+            await start_screensaver(config, deck)
+
+    config._screensaver_task = asyncio.create_task(wait_and_start())
+
+
+def stop_screensaver(
+    config: Config,
+    deck: StreamDeck,
+    complete_state: StateDict | None = None,
+) -> bool:
+    """Stop the screensaver. Returns True if it was running.
+
+    With `complete_state` the keys are redrawn and the brightness restored.
+    """
+    was_active = config._screensaver_active
+    config._screensaver_active = False
+    if config._screensaver_task is not None:
+        config._screensaver_task.cancel()
+        config._screensaver_task = None
+    if was_active and complete_state is not None:
+        console.log("Stopping screensaver")
+        if config._is_on:
+            deck.set_brightness(config.brightness)
+        update_all_key_images(deck, config, complete_state)
+        update_all_dials(deck, config, complete_state)
+    return was_active
 
 
 async def handle_changes(
@@ -2162,6 +2344,8 @@ def update_key_image(
     key_pressed: bool = False,
 ) -> None:
     """Update the image for a key."""
+    if config._screensaver_active:
+        return  # the screensaver owns the keys until a key press stops it
     button = config.button(key)
 
     def clear_image() -> None:
@@ -2220,6 +2404,7 @@ def turn_off(config: Config, deck: StreamDeck) -> None:
     if not config._is_on:
         return
     config._is_on = False
+    stop_screensaver(config, deck)
     # This resets all buttons except the turn-off button that
     # was just pressed, however, this doesn't matter with the
     # 0 brightness. Unless no button was pressed.
@@ -2282,6 +2467,9 @@ def _on_touchscreen_event_callback(
         value: dict[str, int],
     ) -> None:
         console.log(f"Touchscreen event {event_type} called at value {value}")
+        if stop_screensaver(config, deck, complete_state):
+            reset_inactivity_timer(config, deck)
+            return
         reset_inactivity_timer(config, deck)
         if event_type == TouchscreenEventType.DRAG:
             # go to next or previous page
@@ -2405,6 +2593,9 @@ def _on_dial_event_callback(
         console.log(
             f"Dial {dial_num} event {event_type} at value {value} has been called",
         )
+        if stop_screensaver(config, deck, complete_state):
+            reset_inactivity_timer(config, deck)
+            return
         reset_inactivity_timer(config, deck)
         dial = config.dial_sorted(dial_num)
         assert dial is not None
@@ -2559,6 +2750,18 @@ def _on_press_callback(
         key_pressed: bool,  # noqa: FBT001
     ) -> None:
         console.log(f"Key {key} {'pressed' if key_pressed else 'released'}")
+        if config._screensaver_active:
+            # Waking up from the screensaver: this press does nothing else
+            if key_pressed:
+                config._screensaver_wake_keys.add(key)
+                stop_screensaver(config, deck, complete_state)
+                reset_inactivity_timer(config, deck)
+            return
+        if not key_pressed and key in config._screensaver_wake_keys:
+            config._screensaver_wake_keys.discard(key)
+            return  # release of the key that stopped the screensaver
+        if key_pressed:
+            config._screensaver_wake_keys.discard(key)
         reset_inactivity_timer(config, deck)
 
         button = config.button(key)
@@ -2886,6 +3089,7 @@ async def _run_connection_session(
             # Turn on state entity boolean on home assistant
             await _sync_input_boolean(config.state_entity_id, websocket, "on")
             update_all_key_images(deck, config, complete_state)
+            reset_screensaver_timer(config, deck)
             deck.set_key_callback_async(
                 _on_press_callback(websocket, complete_state, config),
             )
