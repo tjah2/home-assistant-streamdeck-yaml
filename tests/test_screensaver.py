@@ -23,10 +23,15 @@ from home_assistant_streamdeck_yaml import (
     Immich,
     Page,
     Screensaver,
+    ScreensaverText,
+    _draw_overlay,
     _immich_photos,
     _on_press_callback,
+    _OverlayText,
     _photo_tiles,
+    _screensaver_frame,
     _screensaver_photos,
+    _screensaver_texts,
     reset_screensaver_timer,
     stop_screensaver,
     turn_off,
@@ -290,6 +295,7 @@ def immich() -> Iterator[str]:
     thread.start()
     yield f"http://127.0.0.1:{server.server_address[1]}"
     server.shutdown()
+    server.server_close()
 
 
 def test_screensaver_needs_folder_or_immich() -> None:
@@ -362,3 +368,103 @@ async def test_screensaver_with_immich_album(deck: Mock, immich: str) -> None:
     assert {c.args[0] for c in deck.set_key_image.call_args_list} == set(range(ROWS * COLS))
     assert any(r.startswith("/api/assets/") for r in _FakeImmich.requests)
     stop_screensaver(config, deck)
+
+
+# --- Text over the photo (e.g. a birthday calendar) ---------------------------------
+
+BIRTHDAYS = {
+    "sensor.verjaardagen": {
+        "entity_id": "sensor.verjaardagen",
+        "state": "2",
+        "attributes": {"lijst": [{"dag": 3, "naam": "Oma"}, {"dag": 17, "naam": "Kees\nde Vries"}]},
+    },
+}
+DAY = "{% set l = state_attr('sensor.verjaardagen', 'lijst') or [] %}{{ l[key].dag if key < l | count }}"
+NAME = "{% set l = state_attr('sensor.verjaardagen', 'lijst') or [] %}{{ l[key].naam if key < l | count }}"
+
+
+def _overlay_config(photos: Path, overlay: list[Any], **screensaver: Any) -> Config:
+    config = _config(photos, overlay=overlay, **screensaver)
+    config._screensaver_states = BIRTHDAYS
+    return config
+
+
+def test_overlay_templates_per_key(photos: Path) -> None:
+    """`key` picks the item for each key; an empty result means no text."""
+    entry = {"corner": DAY, "text": NAME}
+    config = _overlay_config(photos, [entry] * ROWS * COLS)
+    texts = _screensaver_texts(config, ROWS * COLS)
+    assert [(t.corner, t.text) for t in texts[:2] if t] == [("3", "Oma"), ("17", "Kees\nde Vries")]
+    assert texts[2:] == [None] * (ROWS * COLS - 2)
+
+
+def test_overlay_entries_and_colors(photos: Path) -> None:
+    """Empty entries, plain text, a color template, and keys after the list."""
+    config = _overlay_config(
+        photos,
+        [None, {}, {"text": "Hoi", "text_color": "{{ 'red' if key == 2 else 'blue' }}"}],
+    )
+    texts = _screensaver_texts(config, ROWS * COLS)
+    assert texts[:2] == [None, None]
+    assert texts[2] is not None
+    assert (texts[2].text, texts[2].corner, texts[2].text_color) == ("Hoi", "", "red")
+    assert texts[3:] == [None] * (ROWS * COLS - 3)
+
+
+def test_overlay_template_error_draws_nothing(photos: Path) -> None:
+    """A broken template shows no raw template code on the photo."""
+    config = _overlay_config(
+        photos,
+        [{"text": "{{ now() }}"}, {"text": "{{ 1 / 0 }}"}, {"corner": "{{ 'ok' }}"}],
+    )
+    texts = _screensaver_texts(config, 3)
+    assert texts[:2] == [None, None]
+    assert texts[2] is not None
+    assert texts[2].corner == "ok"
+
+
+WHITE, DARK = 740, 60  # sums of R+G+B
+
+
+def test_overlay_is_drawn_readable() -> None:
+    """White letters with a dark edge in the corner and at the bottom; other keys unchanged."""
+    tile = Image.new("RGB", (KEY, KEY), (230, 230, 230))  # light photo: hard for white text
+    style = ScreensaverText(corner="3", text="Oma")
+    drawn = _draw_overlay(tile, _OverlayText("3", "Oma", style, "white"))
+    assert drawn.size == tile.size
+    assert tile.getpixel((5, 5)) == (230, 230, 230)  # the original is not changed
+
+    def colors(box: tuple[int, int, int, int]) -> set[tuple[int, int, int]]:
+        return {color for _, color in drawn.crop(box).getcolors(KEY * KEY)}
+
+    corner, bottom, middle = (0, 0, 24, 24), (14, 54, 58, 72), (20, 26, 52, 46)
+    for box in (corner, bottom):
+        found = colors(box)
+        assert any(sum(c) > WHITE for c in found)  # white letters
+        assert any(sum(c) < DARK for c in found)  # dark edge
+    assert colors(middle) == {(230, 230, 230)}
+
+    no_edge = ScreensaverText(text="Oma", outline=0)
+    plain = _draw_overlay(tile, _OverlayText("", "Oma", no_edge, "white"))
+    assert not any(sum(c) < DARK for _, c in plain.crop(bottom).getcolors(KEY * KEY))
+
+
+async def test_screensaver_with_overlay_and_wake_up(deck: Mock, photos: Path) -> None:
+    """Keys with text get a different image; a press still only stops the screensaver."""
+    config = _config(photos, shuffle=False, overlay=[{"corner": DAY, "text": NAME}] * ROWS * COLS)
+    state: dict[str, Any] = dict(BIRTHDAYS)
+    press = ft.partial(_on_press_callback(Mock(), state, config), deck)
+    reset_screensaver_timer(config, deck, state)
+    await _wait_for(
+        lambda: config._screensaver_active and deck.set_key_image.call_count >= ROWS * COLS,
+    )
+    images = {c.args[0]: c.args[1] for c in deck.set_key_image.call_args_list[: ROWS * COLS]}
+    plain = _screensaver_frame(deck, photos / "a.jpg")  # the first photo, without text
+    assert plain is not None
+    # Keys 0 and 1 have a birthday, the other keys show just the photo
+    assert [images[k] != plain[k] for k in range(4)] == [True, True, False, False]
+
+    await press(0, True)  # noqa: FBT003
+    await press(0, False)  # noqa: FBT003
+    assert not config._screensaver_active
+    assert config.current_page().name == "home"
