@@ -944,6 +944,44 @@ class Immich(BaseModel, extra="forbid"):  # type: ignore[call-arg]
         return cls.to_pandas_table().to_markdown(index=False)
 
 
+class ScreensaverText(BaseModel, extra="forbid"):  # type: ignore[call-arg]
+    """Text drawn over the screensaver photo on one key, e.g. for a birthday calendar.
+
+    `corner` and `text` are templates like a button's `text`, with one extra
+    variable: `key`, the number of the key counting from 0 (the first key is 0).
+    So the same template can be used for every key, e.g. to pick `key`-th item
+    from a list in an attribute. An empty result draws nothing.
+    """
+
+    corner: str | None = Field(
+        default=None,
+        description="Small text in the top left corner, e.g. a day number. Template.",
+    )
+    text: str | None = Field(
+        default=None,
+        description="Text at the bottom, centered, e.g. a name. May have more lines. Template.",
+    )
+    corner_size: int = Field(default=14, description="Font size of `corner`.")
+    text_size: int = Field(default=12, description="Font size of `text`.")
+    text_color: str = Field(default="white", description="Color of the text. Template.")
+    outline: int = Field(
+        default=2,
+        description="Width of the dark edge around the letters (0 for none),"
+        " so the text stays readable on any photo.",
+    )
+    outline_color: str = Field(default="black", description="Color of the edge.")
+
+    @classmethod
+    def to_pandas_table(cls: type[ScreensaverText]) -> pd.DataFrame:
+        """Return a pandas DataFrame with the schema."""
+        return to_pandas_table(cls)
+
+    @classmethod
+    def to_markdown_table(cls: type[ScreensaverText]) -> str:
+        """Return a markdown table with the schema."""
+        return cls.to_pandas_table().to_markdown(index=False)
+
+
 class Screensaver(BaseModel, extra="forbid"):  # type: ignore[call-arg]
     """Photo slideshow across all keys, shown after a period without key presses.
 
@@ -976,6 +1014,12 @@ class Screensaver(BaseModel, extra="forbid"):  # type: ignore[call-arg]
     brightness: int | None = Field(
         default=None,
         description="Brightness (0-100) while the screensaver runs. If empty, the brightness is unchanged.",
+    )
+    overlay: list[ScreensaverText | None] = Field(
+        default_factory=list,
+        description="Text over the photo, one entry per key in key order (like `buttons`)."
+        " Use `null` or `{}` for a key without text; keys after the list have none."
+        " The texts are filled in again with every new photo. See `ScreensaverText`.",
     )
 
     @validator("after", "interval")
@@ -1064,6 +1108,7 @@ class Config(BaseModel):
     _screensaver_task: asyncio.Task | None = PrivateAttr(default=None)
     _screensaver_active: bool = PrivateAttr(default=False)
     _screensaver_wake_keys: set[int] = PrivateAttr(default_factory=set)
+    _screensaver_states: StateDict | None = PrivateAttr(default=None)
 
     @classmethod
     def load(
@@ -1778,7 +1823,77 @@ def _open_photo(photo: Path | ImmichPhoto) -> Image.Image:
     return Image.open(photo)
 
 
-def _screensaver_frame(deck: StreamDeck, path: Path | ImmichPhoto) -> list[bytes] | None:
+class _OverlayText(NamedTuple):
+    corner: str
+    text: str
+    style: ScreensaverText
+    text_color: str
+
+
+def _render_overlay_value(template: str | None, complete_state: StateDict, key: int) -> str:
+    if not template:
+        return ""
+    return _render_jinja(template, complete_state, variables={"key": key}, raise_errors=True)
+
+
+def _screensaver_texts(config: Config, key_count: int) -> list[_OverlayText | None]:
+    """Fill in the overlay templates for every key (None: no text)."""
+    assert config.screensaver is not None
+    states = config._screensaver_states or {}
+    texts: list[_OverlayText | None] = []
+    for key in range(key_count):
+        style = config.screensaver.overlay[key] if key < len(config.screensaver.overlay) else None
+        if style is None:
+            texts.append(None)
+            continue
+        try:
+            corner = _render_overlay_value(style.corner, states, key)
+            text = _render_overlay_value(style.text, states, key)
+            color = _render_overlay_value(style.text_color, states, key) or "white"
+        except Exception as e:  # noqa: BLE001
+            console.log(f"[b red]Screensaver: text on key {key} failed: {type(e).__name__}: {e}[/]")
+            texts.append(None)
+            continue
+        texts.append(_OverlayText(corner, text, style, color) if corner or text else None)
+    return texts
+
+
+def _draw_overlay(tile: Image.Image, overlay: _OverlayText) -> Image.Image:
+    """Draw the corner text and the bottom text on a key's part of the photo."""
+    tile = tile.copy()
+    draw = ImageDraw.Draw(tile)
+    width, height = tile.size
+    style = overlay.style
+    margin = max(3, round(width / 18))
+    try:
+        ImageColor.getrgb(overlay.text_color)
+        color = overlay.text_color
+    except ValueError:
+        color = "white"
+    stroke = {"stroke_width": max(0, style.outline), "stroke_fill": style.outline_color}
+    font_file = str(ASSETS_PATH / DEFAULT_FONT)
+    if overlay.corner:
+        font = ImageFont.truetype(font_file, style.corner_size)
+        draw.text((margin, margin), overlay.corner, font=font, anchor="la", fill=color, **stroke)
+    if overlay.text:
+        font = ImageFont.truetype(font_file, style.text_size)
+        draw.multiline_text(
+            (width / 2, height - margin),
+            overlay.text,
+            font=font,
+            anchor="md",
+            align="center",
+            fill=color,
+            **stroke,
+        )
+    return tile
+
+
+def _screensaver_frame(
+    deck: StreamDeck,
+    path: Path | ImmichPhoto,
+    texts: list[_OverlayText | None] | None = None,
+) -> list[bytes] | None:
     """Load a photo and turn it into native key images. Runs in a thread."""
     rows, cols = deck.key_layout()
     key_size = deck.key_image_format()["size"]
@@ -1790,7 +1905,11 @@ def _screensaver_frame(deck: StreamDeck, path: Path | ImmichPhoto) -> list[bytes
     except Exception as e:  # noqa: BLE001
         console.log(f"[b red]Screensaver: cannot show {path}: {e}[/]")
         return None
-    return [PILHelper.to_native_format(deck, tile) for tile in tiles[: deck.key_count()]]
+    tiles = tiles[: deck.key_count()]
+    for key, overlay in enumerate(texts or []):
+        if overlay is not None and key < len(tiles):
+            tiles[key] = _draw_overlay(tiles[key], overlay)
+    return [PILHelper.to_native_format(deck, tile) for tile in tiles]
 
 
 async def start_screensaver(config: Config, deck: StreamDeck) -> None:
@@ -1812,7 +1931,9 @@ async def start_screensaver(config: Config, deck: StreamDeck) -> None:
             queue = await asyncio.to_thread(_screensaver_photos, config) or photos
             if config.screensaver.shuffle:
                 random.shuffle(queue)
-        frame = await asyncio.to_thread(_screensaver_frame, deck, queue.pop(0))
+        # Fill in the templates here (not in the thread): the states change in this loop
+        texts = _screensaver_texts(config, deck.key_count())
+        frame = await asyncio.to_thread(_screensaver_frame, deck, queue.pop(0), texts)
         if frame is not None and config._screensaver_active:
             with deck:
                 for key, image in enumerate(frame):
@@ -1820,8 +1941,17 @@ async def start_screensaver(config: Config, deck: StreamDeck) -> None:
         await asyncio.sleep(config.screensaver.interval)
 
 
-def reset_screensaver_timer(config: Config, deck: StreamDeck) -> None:
-    """(Re)start the countdown to the screensaver."""
+def reset_screensaver_timer(
+    config: Config,
+    deck: StreamDeck,
+    complete_state: StateDict | None = None,
+) -> None:
+    """(Re)start the countdown to the screensaver.
+
+    `complete_state` (kept up to date by the caller) is what the overlay texts use.
+    """
+    if complete_state is not None:
+        config._screensaver_states = complete_state
     if config._screensaver_active:
         return  # only a key press stops a running screensaver
     if config._screensaver_task is not None:
@@ -2143,8 +2273,15 @@ def _render_jinja(
     text: str,
     complete_state: StateDict,
     dial: Dial | None = None,
+    *,
+    variables: dict[str, Any] | None = None,
+    raise_errors: bool = False,
 ) -> str:
-    """Render a Jinja template."""
+    """Render a Jinja template.
+
+    `variables` are extra names for the template. On a template error the raw
+    text is returned, or with `raise_errors` the error is raised.
+    """
     if not isinstance(text, str):
         return text
     if "{" not in text:
@@ -2168,8 +2305,11 @@ def _render_jinja(
             round=_round,
             dial_value=ft.partial(_dial_value, dial=dial),
             dial_attr=ft.partial(_dial_attr, dial=dial),
+            **(variables or {}),
         ).strip()
     except jinja2.exceptions.TemplateError as err:
+        if raise_errors:
+            raise
         console.print_exception(show_locals=True)
         console.log(f"Error rendering template: {err} with error type {type(err)}")
         return text
@@ -3248,7 +3388,7 @@ async def _run_connection_session(
             # Turn on state entity boolean on home assistant
             await _sync_input_boolean(config.state_entity_id, websocket, "on")
             update_all_key_images(deck, config, complete_state)
-            reset_screensaver_timer(config, deck)
+            reset_screensaver_timer(config, deck, complete_state)
             deck.set_key_callback_async(
                 _on_press_callback(websocket, complete_state, config),
             )
