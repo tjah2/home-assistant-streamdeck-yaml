@@ -1080,6 +1080,13 @@ class Config(BaseModel):
         description="The entity ID to sync display brightness with (0-100). For"
         " example `input_number.streamdeck_brightness`.",
     )
+    page_entity_id: str | None = Field(
+        default=None,
+        description="The entity ID whose state selects the page. When its state"
+        " becomes the name of a page, the Stream Deck jumps to that page and"
+        " stops the screensaver. Other states are ignored. For example"
+        " `input_text.streamdeck_page`.",
+    )
     auto_reload: bool = Field(
         default=False,
         description="If True, the configuration YAML file will automatically"
@@ -2082,6 +2089,13 @@ def _update_state(
                 )
                 return
 
+            # Handle the page entity (jump to the page named by its state)
+            if eid == config.page_entity_id:
+                old_state = event_data.get("old_state") or {}
+                if old_state.get("state") != complete_state[eid]["state"]:
+                    _sync_page_from_entity(config, deck, complete_state)
+                return
+
             # Handle the state entity (turning on/off display)
             if eid == config.state_entity_id:
                 is_on = complete_state[config.state_entity_id]["state"] == "on"
@@ -2112,6 +2126,28 @@ def _update_state(
                     complete_state=complete_state,
                     key_pressed=False,
                 )
+
+
+def _sync_page_from_entity(
+    config: Config,
+    deck: StreamDeck,
+    complete_state: StateDict,
+) -> None:
+    """Jump to the page named by the state of `config.page_entity_id`."""
+    if config.page_entity_id is None:
+        return
+    page = (complete_state.get(config.page_entity_id) or {}).get("state")
+    names = {p.name for p in config.pages} | {p.name for p in config.anonymous_pages}
+    if page not in names:
+        return
+    console.log(f"Going to page {page} from {config.page_entity_id}")
+    stop_screensaver(config, deck)
+    config.to_page(page)
+    if config._is_on:
+        update_all_key_images(deck, config, complete_state)
+        update_all_dials(deck, config, complete_state)
+        deck.set_brightness(config.brightness)
+    reset_screensaver_timer(config, deck)
 
 
 def _state_attr(
@@ -3387,6 +3423,7 @@ async def _run_connection_session(
 
             # Turn on state entity boolean on home assistant
             await _sync_input_boolean(config.state_entity_id, websocket, "on")
+            _sync_page_from_entity(config, deck, complete_state)
             update_all_key_images(deck, config, complete_state)
             reset_screensaver_timer(config, deck, complete_state)
             deck.set_key_callback_async(
