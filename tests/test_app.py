@@ -1855,3 +1855,45 @@ async def test_inactivity_timer_turns_off_deck(mock_deck: Mock) -> None:
     assert config._is_on is False
     mock_deck.reset.assert_called()
     mock_deck.set_brightness.assert_called_with(0)
+
+
+async def test_page_entity_id(config: Config, mock_deck: Mock, state: dict[str, dict]) -> None:
+    """The deck jumps to the page named by the state of `page_entity_id`."""
+    from home_assistant_streamdeck_yaml import _sync_page_from_entity, _update_state
+
+    eid = "input_text.streamdeck_page"
+    config.page_entity_id = eid
+    config._screensaver_active = True
+    assert config._current_page_index == 0
+
+    def event(old: str, new: str) -> dict:
+        return {
+            "type": "event",
+            "event": {
+                "event_type": "state_changed",
+                "data": {
+                    "entity_id": eid,
+                    "old_state": {"state": old},
+                    "new_state": {"state": new},
+                },
+            },
+        }
+
+    # A page name: jump there and stop the screensaver
+    _update_state(state, event("", "Second"), config, mock_deck)
+    assert config._current_page_index == 1
+    assert not config._screensaver_active
+
+    # Not a page name: stay on the current page
+    config.to_page(0)
+    _update_state(state, event("Second", "unknown"), config, mock_deck)
+    assert config._current_page_index == 0
+
+    # Only an attribute change (same state): do nothing
+    _update_state(state, event("Second", "Second"), config, mock_deck)
+    assert config._current_page_index == 0
+
+    # At startup the current state is applied
+    state[eid] = {"state": "Second"}
+    _sync_page_from_entity(config, mock_deck, state)
+    assert config._current_page_index == 1
